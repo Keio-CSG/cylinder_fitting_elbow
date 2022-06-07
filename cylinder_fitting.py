@@ -37,10 +37,9 @@ def cylinderFitting(xyz,p,th):
 
     print("first error", np.linalg.norm(errfunc(p, x, y, z)))
 
-    # est_p , success = leastsq(errfunc, p, args=(x, y, z), maxfev=10000)
-    print(p)
+    # print(p)
     result = minimize(errfunc, p, args=(x, y, z), method="COBYLA", options={'maxiter': 10000}, constraints=({'type': 'ineq', 'fun': lambda p: p[4] - 1}))
-    print(result)
+    # print(result)
 
     print("final error", np.linalg.norm(errfunc(result.x, x, y, z)))
 
@@ -59,27 +58,14 @@ def gen_intrinsics():
     intr.coeffs = [0.0, 0.0, 0.0, 0.0, 0.0]
     return intr
 
-def visualize_frame_3d(frame, frame_id):
+def get_keypoints(color_frame, depth_frame):
     """
-    Visualize a frame in 3D.
-    """
-    print(frame.shape)
-    print(frame)
-    points = []
-    for x in range(frame.shape[1]):
-        for y in range(frame.shape[0]):
-            if frame[y, x] > 0 and frame[y, x] < 1500:
-                points.append(rs.rs2_deproject_pixel_to_point(
-                    gen_intrinsics(),
-                    [x,y], frame[y,x]
-                ))
-    # Create a point cloud from the frame.
-    pcd = o3d.geometry.PointCloud()
-    pcd.points = o3d.utility.Vector3dVector(points)
-    # Visualize the point cloud.
-    o3d.visualization.draw_geometries([pcd])
+    RGB画像とDepth画像から体の関節点をmediapipeで抽出する
 
-def calc_cylinder(color_frame, depth_frame, frame_id):
+    Returns: (landmarks, landmarks_world)
+    landmarks: 体の関節点のリスト(x,yは画像のピクセル、zはmm単位)
+    landmarks_world: 体の関節点の世界座標のリスト(z座標はでたらめ)
+    """
     mp_pose = mp.solutions.pose
     landmarks = []
     landmarks_world = []
@@ -105,29 +91,180 @@ def calc_cylinder(color_frame, depth_frame, frame_id):
                     landmarks_world.append(rs.rs2_deproject_pixel_to_point(
                         gen_intrinsics(),
                         [landmark.x * image_width, landmark.y * image_height],
-                        1000
+                        0
                     ))
             for i in range(len(landmarks)):
                 cv2.circle(color_frame, landmarks[i], 2, (0, 0, 255), -1)
-                if i in [12, 14, 16]:
-                    print(i, landmarks[i], depth_frame[landmarks[i][1], landmarks[i][0]])
+                # if i in [12, 14, 16]:
+                #     print(i, landmarks[i], depth_frame[landmarks[i][1], landmarks[i][0]])
 
+    return landmarks, landmarks_world
+
+def fit_cylinder_to_bone(pcd, landmark_a, landmark_b, color=None):
+    geometries = []
+    corners = None
+    width = 100 # 腕の幅の半分の px
+    if landmark_a[0] == landmark_b[0]:
+        corners = np.array([
+            [landmark_a[0] + width, landmark_a[1],0],
+            [landmark_a[0] - width, landmark_a[1],0],
+            [landmark_b[0] - width, landmark_b[1],0],
+            [landmark_b[0] + width, landmark_b[1],0],
+        ])
+    else:
+        theta = np.arctan((landmark_b[1] - landmark_a[1]) / (landmark_b[0] - landmark_a[0]))
+        dx = np.sin(theta) * width
+        dy = np.cos(theta) * width
+        corners = np.array([
+            [landmark_a[0] - dx, landmark_a[1] + dy,0],
+            [landmark_a[0] + dx, landmark_a[1] - dy,0],
+            [landmark_b[0] + dx, landmark_b[1] - dy,0],
+            [landmark_b[0] - dx, landmark_b[1] + dy,0],
+        ])
+    
+    # 軸に平行な長方形で切り出す場合
+    # x_min = min(landmark_a[0], landmark_b[0]) - 50
+    # x_max = max(landmark_a[0], landmark_b[0]) + 50
+    # y_min = min(landmark_a[1], landmark_b[1]) - 50
+    # y_max = max(landmark_a[1], landmark_b[1]) + 50
+    # # 腕の部分だけの点群を抽出
+    # corners = np.array([
+    #     [x_min, y_min, 0],
+    #     [x_min, y_max, 0],
+    #     [x_max, y_max, 0],
+    #     [x_max, y_min, 0],
+    # ], dtype=np.float64)
+    vol = o3d.visualization.SelectionPolygonVolume()
+    vol.orthogonal_axis = "Z"
+    vol.axis_max = max(landmark_a[2], landmark_b[2]) + 50
+    vol.axis_min = min(landmark_a[2], landmark_b[2]) - 50
+    vol.bounding_polygon = o3d.utility.Vector3dVector(corners)
+    cropped_pcd = vol.crop_point_cloud(pcd)
+    if color is not None:
+        cropped_pcd.paint_uniform_color(color)
+        geometries.append(cropped_pcd)
+
+    # 円筒を近似
+    point_a = (landmark_a[0], landmark_a[1], landmark_a[2])
+    point_b = (landmark_b[0], landmark_b[1], landmark_b[2])
+    init_radius = 40 # mm
+    point_a = (point_a[0], point_a[1], point_a[2] + init_radius)
+    point_b = (point_b[0], point_b[1], point_b[2] + init_radius)
+    xz_a = (point_a[2] - point_b[2]) / (point_a[0] - point_b[0])
+    yz_a = (point_a[2] - point_b[2]) / (point_a[1] - point_b[1])
+    xz_b = point_a[0] - point_a[2] / xz_a
+    yz_b = point_a[1] - point_a[2] / yz_a
+    angle_xz = np.arctan(xz_a)
+    angle_yz = np.arctan(-yz_a)
+    points = np.asarray(cropped_pcd.points)
+
+    fitted = cylinderFitting(
+        points,
+        [xz_b, yz_b, angle_yz, angle_xz, init_radius],
+        0
+    )
+    # print(fitted)
+
+    transform = np.array([
+        [1,0,0,-fitted[0]],
+        [0,1,0,-fitted[1]],
+        [0,0,1,0],
+        [0,0,0,1]
+    ])
+    transform = np.dot(np.array([
+        [np.cos(-fitted[3]), 0, -np.sin(-fitted[3]), 0],
+        [0, 1, 0, 0],
+        [np.sin(-fitted[3]), 0, np.cos(-fitted[3]), 0],
+        [0, 0, 0, 1]
+    ]), transform)
+    transform = np.dot(np.array([
+        [1, 0, 0, 0],
+        [0, np.cos(-fitted[2]), np.sin(-fitted[2]), 0],
+        [0, -np.sin(-fitted[2]), np.cos(-fitted[2]), 0],
+        [0, 0, 0, 1]
+    ]), transform)
+    transform = np.dot(np.array([
+        [1, 0, 0, fitted[0]],
+        [0, 1, 0, fitted[1]],
+        [0, 0, 1, 0],
+        [0, 0, 0, 1]
+    ]), transform)
+
+    origin = np.array([
+        fitted[0], fitted[1], 0
+    ])
+    distance_to_a = np.linalg.norm(origin - np.array(list(point_a)))
+    distance_to_b = np.linalg.norm(origin - np.array(list(point_b)))
+    cylinder_max = max(distance_to_a, distance_to_b)
+    cylinder_min = min(distance_to_a, distance_to_b)
+    # print(cylinder_max, cylinder_min)
+
+    points = [
+        [fitted[0], fitted[1], cylinder_min - 500],
+        [fitted[0], fitted[1], cylinder_max + 500],
+    ]
+    lines = [[0, 1]]
+    colors = [[1, 0, 0] for i in range(len(lines))]
+    line_set = o3d.geometry.LineSet()
+    line_set.points = o3d.utility.Vector3dVector(points)
+    line_set.lines = o3d.utility.Vector2iVector(lines)
+    line_set.colors = o3d.utility.Vector3dVector(colors)
+    line_set.transform(transform)
+    geometries.append(line_set)
+
+    top = np.dot(
+        transform, 
+        np.array([[fitted[0], fitted[1], 5000, 1]]).T
+    )
+
+    points = [
+        [fitted[0], fitted[1], 0],
+        [top[0], top[1], top[2]]
+    ]
+    direction_vec = np.array([
+        points[1][0] - points[0][0],
+        points[1][1] - points[0][1],
+        points[1][2] - points[0][2]
+    ]).reshape(3,)
+    # lines = [[0, 1]]
+    # colors = [[1, 0, 0] for i in range(len(lines))]
+    # line_set = o3d.geometry.LineSet()
+    # line_set.points = o3d.utility.Vector3dVector(points)
+    # line_set.lines = o3d.utility.Vector2iVector(lines)
+    # line_set.colors = o3d.utility.Vector3dVector(colors)
+    # geometries.append(line_set)
+
+    cylinder = o3d.geometry.TriangleMesh.create_cylinder(
+        radius=fitted[4],
+        height=cylinder_max - cylinder_min,
+        resolution=10
+    )
+    cylinder.translate([fitted[0], fitted[1], (cylinder_max + cylinder_min)/2])
+    cylinder.transform(transform)
+
+    cylinder = o3d.geometry.LineSet.create_from_triangle_mesh(cylinder)
+    cylinder.paint_uniform_color([0, 0, 1] if color is None else color)
+    geometries.append(cylinder)
+
+    cropped_pcd.translate([0,0,-10])
+    return geometries, direction_vec
+
+def calc_cylinder(color_frame, depth_frame, frame_id):
+
+    landmarks, landmarks_world = get_keypoints(color_frame, depth_frame)
+
+    # カラー情報も付けて人を切り出す
     points = []
     colors = []
+    max_z_th = max(landmarks_world[12:17:2], key=lambda x: x[2])[2] + 100
     for x in range(depth_frame.shape[1]):
         for y in range(depth_frame.shape[0]):
-            if depth_frame[y, x] > 0 and depth_frame[y, x] < 1500:
+            if depth_frame[y, x] > 0 and depth_frame[y, x] < max_z_th:
                 points.append(rs.rs2_deproject_pixel_to_point(
                     gen_intrinsics(),
                     [x,y], depth_frame[y,x]
                 ))
                 colors.append(color_frame[y, x][::-1] / 255)
-            if x == 256 and y == 192:
-                print("elbow", points[-1])
-            if x == 340 and y == 156:
-                print("shoulder", points[-1])
-            if x == 168 and y == 171:
-                print("wrist", points[-1])
     # Create a point cloud from the frame.
     pcd = o3d.geometry.PointCloud()
     pcd.points = o3d.utility.Vector3dVector(points)
@@ -135,220 +272,30 @@ def calc_cylinder(color_frame, depth_frame, frame_id):
 
     geometries = [pcd]
 
-    #############################################################################################肩-肘
+    s_e_geom, s_e_direction = fit_cylinder_to_bone(pcd, landmarks_world[12], landmarks_world[14], color=[0, 1, 0])
+    geometries.extend(s_e_geom)
 
-    # 腕の部分だけの点群を抽出
-    corners = np.array([
-        [-300, -100, 0],
-        [-300, 100, 0],
-        [20, 100, 0],
-        [20, -100, 0],
-    ], dtype=np.float64)
-    vol = o3d.visualization.SelectionPolygonVolume()
-    vol.orthogonal_axis = "Z"
-    vol.axis_max = 1250
-    vol.axis_min = 1050
-    vol.bounding_polygon = o3d.utility.Vector3dVector(corners)
-    cropped_pcd = vol.crop_point_cloud(pcd)
-    # geometries.append(cropped_pcd)
+    w_e_geom, w_e_direction = fit_cylinder_to_bone(pcd, landmarks_world[16], landmarks_world[14], color=[1, 1, 0])
+    geometries.extend(w_e_geom)
 
-    # 円筒を近似
-    shoulder_point = (landmarks_world[12][0], landmarks_world[12][1], landmarks_world[12][2])
-    elbow_point = (landmarks_world[14][0], landmarks_world[14][1], landmarks_world[14][2])
-    init_radius = 40 # mm
-    shoulder_point = (shoulder_point[0], shoulder_point[1], shoulder_point[2] + init_radius)
-    elbow_point = (elbow_point[0], elbow_point[1], elbow_point[2] + init_radius)
-    xz_a = (shoulder_point[2] - elbow_point[2]) / (shoulder_point[0] - elbow_point[0])
-    yz_a = (shoulder_point[2] - elbow_point[2]) / (shoulder_point[1] - elbow_point[1])
-    xz_b = shoulder_point[0] - shoulder_point[2] / xz_a
-    yz_b = shoulder_point[1] - shoulder_point[2] / yz_a
-    angle_xz = np.arctan(xz_a)
-    angle_yz = np.arctan(-yz_a)
-    points = np.asarray(cropped_pcd.points)
+    if landmarks_world[12][2] < landmarks_world[14][2]:
+        s_e_direction = -s_e_direction
+    if landmarks_world[16][2] < landmarks_world[14][2]:
+        w_e_direction = -w_e_direction
 
-    fitted = cylinderFitting(
-        points,
-        [xz_b, yz_b, angle_yz, angle_xz, init_radius],
-        0
-    )
-    # fitted = [xz_b, yz_b, angle_yz, angle_xz, init_radius]
-    print(fitted)
+    # print("s_e_direction", s_e_direction)
+    # print("w_e_direction", w_e_direction)
 
-    transform = np.array([
-        [1,0,0,-fitted[0]],
-        [0,1,0,-fitted[1]],
-        [0,0,1,0],
-        [0,0,0,1]
-    ])
-    transform = np.dot(np.array([
-        [np.cos(-fitted[3]), 0, -np.sin(-fitted[3]), 0],
-        [0, 1, 0, 0],
-        [np.sin(-fitted[3]), 0, np.cos(-fitted[3]), 0],
-        [0, 0, 0, 1]
-    ]), transform)
-    transform = np.dot(np.array([
-        [1, 0, 0, 0],
-        [0, np.cos(-fitted[2]), np.sin(-fitted[2]), 0],
-        [0, -np.sin(-fitted[2]), np.cos(-fitted[2]), 0],
-        [0, 0, 0, 1]
-    ]), transform)
-    transform = np.dot(np.array([
-        [1, 0, 0, fitted[0]],
-        [0, 1, 0, fitted[1]],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1]
-    ]), transform)
+    length_vec_upperarm = np.linalg.norm(s_e_direction)
+    length_vec_forearm = np.linalg.norm(w_e_direction)
+    inner_product = np.inner(s_e_direction, w_e_direction)
+    angle_rad = np.arccos(
+        inner_product / (length_vec_upperarm * length_vec_forearm))
+    angle_deg = np.rad2deg(angle_rad)
 
-    top = np.dot(
-        transform, 
-        np.array([[fitted[0], fitted[1], 5000, 1]]).T
-    )
-
-    # points = [[fitted[0], fitted[1], 0], [fitted[0] + 1/np.tan(fitted[3]) * 1500, fitted[1] - 1/np.tan(fitted[2]) * 1500, 1500]]
-    points = [
-        [fitted[0], fitted[1], 0],
-        [top[0], top[1], top[2]]
-    ]
-    lines = [[0, 1]]
-    colors = [[1, 0, 0] for i in range(len(lines))]
-    line_set = o3d.geometry.LineSet()
-    line_set.points = o3d.utility.Vector3dVector(points)
-    line_set.lines = o3d.utility.Vector2iVector(lines)
-    line_set.colors = o3d.utility.Vector3dVector(colors)
-    geometries.append(line_set)
-
-    # line = np.linspace(0, 1000, 11, dtype=np.float64)
-    # points = np.meshgrid(line,line,line,indexing='ij')
-
-    cylinder = o3d.geometry.TriangleMesh.create_cylinder(
-        radius=fitted[4],
-        height=10000,
-        resolution=10
-    )
-    cylinder.translate([fitted[0], fitted[1], 0])
-    cylinder.transform(transform)
-
-    cylinder = o3d.geometry.LineSet.create_from_triangle_mesh(cylinder)
-    cylinder.paint_uniform_color([0, 0, 1])
-    geometries.append(cylinder)
-
-
-    #############################################################################################肘-手首
-    # 手首から肘の部分だけの点群を抽出
-    corners = np.array([
-        [-470, -50, 0],
-        [-470, 100, 0],
-        [-200, 100, 0],
-        [-200, -50, 0],
-    ], dtype=np.float64)
-    vol = o3d.visualization.SelectionPolygonVolume()
-    vol.orthogonal_axis = "Z"
-    vol.axis_max = 1100
-    vol.axis_min = 950
-    vol.bounding_polygon = o3d.utility.Vector3dVector(corners)
-    cropped_pcd = vol.crop_point_cloud(pcd)
-    # geometries.append(cropped_pcd)
-
-    # 円筒を近似
-    wrist_point = (landmarks_world[16][0], landmarks_world[16][1], landmarks_world[16][2])
-    elbow_point = (landmarks_world[14][0], landmarks_world[14][1], landmarks_world[14][2])
-    init_radius = 40 # mm
-    wrist_point = (wrist_point[0], wrist_point[1], wrist_point[2] + init_radius)
-    elbow_point = (elbow_point[0], elbow_point[1], elbow_point[2] + init_radius)
-    xz_a = (wrist_point[2] - elbow_point[2]) / (wrist_point[0] - elbow_point[0])
-    yz_a = (wrist_point[2] - elbow_point[2]) / (wrist_point[1] - elbow_point[1])
-    xz_b = wrist_point[0] - wrist_point[2] / xz_a
-    yz_b = wrist_point[1] - wrist_point[2] / yz_a
-    angle_xz = np.arctan(xz_a)
-    angle_yz = np.arctan(-yz_a)
-    points = np.asarray(cropped_pcd.points)
-
-    fitted = cylinderFitting(
-        points,
-        [xz_b, yz_b, angle_yz, angle_xz, init_radius],
-        0
-    )
-    # fitted = [xz_b, yz_b, angle_yz, angle_xz, init_radius]
-    print(fitted)
-
-    transform = np.array([
-        [1,0,0,-fitted[0]],
-        [0,1,0,-fitted[1]],
-        [0,0,1,0],
-        [0,0,0,1]
-    ])
-    transform = np.dot(np.array([
-        [np.cos(-fitted[3]), 0, -np.sin(-fitted[3]), 0],
-        [0, 1, 0, 0],
-        [np.sin(-fitted[3]), 0, np.cos(-fitted[3]), 0],
-        [0, 0, 0, 1]
-    ]), transform)
-    transform = np.dot(np.array([
-        [1, 0, 0, 0],
-        [0, np.cos(-fitted[2]), np.sin(-fitted[2]), 0],
-        [0, -np.sin(-fitted[2]), np.cos(-fitted[2]), 0],
-        [0, 0, 0, 1]
-    ]), transform)
-    transform = np.dot(np.array([
-        [1, 0, 0, fitted[0]],
-        [0, 1, 0, fitted[1]],
-        [0, 0, 1, 0],
-        [0, 0, 0, 1]
-    ]), transform)
-
-    top = np.dot(
-        transform, 
-        np.array([[fitted[0], fitted[1], 5000, 1]]).T
-    )
-
-    # points = [[fitted[0], fitted[1], 0], [fitted[0] + 1/np.tan(fitted[3]) * 1500, fitted[1] - 1/np.tan(fitted[2]) * 1500, 1500]]
-    points = [
-        [fitted[0], fitted[1], 0],
-        [top[0], top[1], top[2]]
-    ]
-    lines = [[0, 1]]
-    colors = [[1, 0, 0] for i in range(len(lines))]
-    line_set = o3d.geometry.LineSet()
-    line_set.points = o3d.utility.Vector3dVector(points)
-    line_set.lines = o3d.utility.Vector2iVector(lines)
-    line_set.colors = o3d.utility.Vector3dVector(colors)
-    geometries.append(line_set)
-
-    # line = np.linspace(0, 1000, 11, dtype=np.float64)
-    # points = np.meshgrid(line,line,line,indexing='ij')
-
-    cylinder = o3d.geometry.TriangleMesh.create_cylinder(
-        radius=fitted[4],
-        height=10000,
-        resolution=10
-    )
-    cylinder.translate([fitted[0], fitted[1], 0])
-    cylinder.transform(transform)
-
-    cylinder = o3d.geometry.LineSet.create_from_triangle_mesh(cylinder)
-    cylinder.paint_uniform_color([0, 1, 0])
-    geometries.append(cylinder)
-
-    # points = []
-    # colors = []
-    # for x in line:
-    #     for y in line:
-    #         for z in line:
-    #             points.append([x,y,z])
-    #             colors.append([x/1000, y/1000, z/1000])
-
-    # pcd = o3d.geometry.PointCloud()
-    # pcd.points = o3d.utility.Vector3dVector(points)
-    # pcd.colors = o3d.utility.Vector3dVector(colors)
-
-    # shoulder_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=5, resolution=20)
-    # shoulder_sphere.translate(shoulder_point)
-
-    # elbow_sphere = o3d.geometry.TriangleMesh.create_sphere(radius=5, resolution=20)
-    # elbow_sphere.translate(elbow_point)
+    print("angle:", angle_deg)
 
     o3d.visualization.draw_geometries(geometries)
-    # o3d.visualization.draw_geometries([pcd])
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -376,5 +323,4 @@ if __name__ == "__main__":
         ret, color_frames[i,:,:,:] = video.read()
 
     calc_cylinder(color_frames[frame_id], depth_frames[frame_id], frame_id)
-    # visualize_frame_3d(depth_frames[frame_id,:,:], frame_id)
     
