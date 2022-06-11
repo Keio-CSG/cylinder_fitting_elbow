@@ -7,6 +7,19 @@ import numpy as np
 import pyrealsense2 as rs
 import mediapipe as mp
 from scipy.optimize import minimize
+import csv
+
+def save_angles(angles, max_angle, min_angle, filetime):
+    """
+    anglesをjson形式で保存する
+    """
+    with open(f'{filetime}_cylinder_angles.csv', 'w') as f:
+        writer = csv.writer(f, lineterminator='\n')
+        writer.writerows(angles)
+
+    with open(f'min_max_angles.csv', 'a') as f:
+        writer = csv.writer(f, lineterminator='\n')
+        writer.writerow([filetime, max_angle, min_angle])
 
 def cylinderFitting(xyz,p,th):
 
@@ -148,12 +161,13 @@ def fit_cylinder_to_bone(pcd, landmark_a, landmark_b, color=None):
     point_a = (landmark_a[0], landmark_a[1], landmark_a[2])
     point_b = (landmark_b[0], landmark_b[1], landmark_b[2])
     init_radius = 40 # mm
+    eps = 1e-6
     point_a = (point_a[0], point_a[1], point_a[2] + init_radius)
     point_b = (point_b[0], point_b[1], point_b[2] + init_radius)
-    xz_a = (point_a[2] - point_b[2]) / (point_a[0] - point_b[0])
-    yz_a = (point_a[2] - point_b[2]) / (point_a[1] - point_b[1])
-    xz_b = point_a[0] - point_a[2] / xz_a
-    yz_b = point_a[1] - point_a[2] / yz_a
+    xz_a = (point_a[2] - point_b[2]) / (point_a[0] - point_b[0] + eps)
+    yz_a = (point_a[2] - point_b[2]) / (point_a[1] - point_b[1] + eps)
+    xz_b = point_a[0] - point_a[2] / (xz_a + eps)
+    yz_b = point_a[1] - point_a[2] / (yz_a + eps)
     angle_xz = np.arctan(xz_a)
     angle_yz = np.arctan(-yz_a)
     points = np.asarray(cropped_pcd.points)
@@ -193,11 +207,17 @@ def fit_cylinder_to_bone(pcd, landmark_a, landmark_b, color=None):
     origin = np.array([
         fitted[0], fitted[1], 0
     ])
+    print(origin, point_a, point_b)
     distance_to_a = np.linalg.norm(origin - np.array(list(point_a)))
     distance_to_b = np.linalg.norm(origin - np.array(list(point_b)))
     cylinder_max = max(distance_to_a, distance_to_b)
     cylinder_min = min(distance_to_a, distance_to_b)
-    # print(cylinder_max, cylinder_min)
+    print(cylinder_max, cylinder_min)
+    # direction = origin - np.array(list(point_a))
+    # if direction[1] > 0:
+    #     tmp = -cylinder_min
+    #     cylinder_min = -cylinder_max
+    #     cylinder_max = tmp
 
     points = [
         [fitted[0], fitted[1], cylinder_min - 500],
@@ -297,6 +317,85 @@ def calc_cylinder(color_frame, depth_frame, frame_id):
 
     o3d.visualization.draw_geometries(geometries)
 
+def visualize_continuously(color_frames, depth_frames, filetime):
+    vis = o3d.visualization.Visualizer()
+    vis.create_window()
+
+    pcd = o3d.geometry.PointCloud()
+    pcd.points = o3d.utility.Vector3dVector(
+        np.random.rand(1000,3) * 3
+    )
+    vis.add_geometry(pcd)
+
+    previous_geometries = []
+
+    max_angle = 0
+    min_angle = 360
+    angles = []
+
+    for i in range(color_frames.shape[0]):
+        color_frame = color_frames[i,:,:,:]
+        depth_frame = depth_frames[i,:,:]
+        landmarks, landmarks_world = get_keypoints(color_frame, depth_frame)
+
+        # カラー情報も付けて人を切り出す
+        points = []
+        colors = []
+        max_z_th = max(landmarks_world[12:17:2], key=lambda x: x[2])[2] + 100
+        for x in range(depth_frame.shape[1]):
+            for y in range(depth_frame.shape[0]):
+                if depth_frame[y, x] > 0 and depth_frame[y, x] < max_z_th:
+                    points.append(rs.rs2_deproject_pixel_to_point(
+                        gen_intrinsics(),
+                        [x,y], depth_frame[y,x]
+                    ))
+                    colors.append(color_frame[y, x][::-1] / 255)
+        # Create a point cloud from the frame.
+        pcd.points = o3d.utility.Vector3dVector(points)
+        pcd.colors = o3d.utility.Vector3dVector(colors)
+
+        geometries = []
+
+        s_e_geom, s_e_direction = fit_cylinder_to_bone(pcd, landmarks_world[12], landmarks_world[14], color=[0, 1, 0])
+        geometries.extend(s_e_geom)
+
+        w_e_geom, w_e_direction = fit_cylinder_to_bone(pcd, landmarks_world[16], landmarks_world[14], color=[1, 1, 0])
+        geometries.extend(w_e_geom)
+
+        if landmarks_world[12][2] < landmarks_world[14][2]:
+            s_e_direction = -s_e_direction
+        if landmarks_world[16][2] < landmarks_world[14][2]:
+            w_e_direction = -w_e_direction
+
+        # print("s_e_direction", s_e_direction)
+        # print("w_e_direction", w_e_direction)
+
+        length_vec_upperarm = np.linalg.norm(s_e_direction)
+        length_vec_forearm = np.linalg.norm(w_e_direction)
+        inner_product = np.inner(s_e_direction, w_e_direction)
+        angle_rad = np.arccos(
+            inner_product / (length_vec_upperarm * length_vec_forearm))
+        angle_deg = np.rad2deg(angle_rad)
+        angles.append([i, angle_deg])
+        max_angle = max(angle_deg, max_angle)
+        min_angle = min(angle_deg, min_angle)
+
+        print("angle:", angle_deg)
+        vis.update_geometry(pcd)
+        for g in previous_geometries:
+            vis.remove_geometry(g)
+        for g in geometries:
+            vis.add_geometry(g)
+        previous_geometries = geometries
+        # vis.update_geometry(pcd)
+        vis.poll_events()
+        vis.update_renderer()
+
+    save_angles(angles, max_angle, min_angle, filetime)
+
+    print("max_angle:", max_angle)
+    print("min_angle:", min_angle)
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("json", help="configuration file path")
@@ -312,6 +411,7 @@ if __name__ == "__main__":
     color_path = os.path.join(dir, config["color_file"])
     depth_path = os.path.join(dir, config["depth_file"])
     frequency = config["frequency"]
+    filetime = "ex2" + config["time"]
 
     depth_frames = np.load(depth_path)
     depth_frames = depth_frames[depth_frames.files[0]]
@@ -322,5 +422,7 @@ if __name__ == "__main__":
     for i in range(depth_frames.shape[0]):
         ret, color_frames[i,:,:,:] = video.read()
 
-    calc_cylinder(color_frames[frame_id], depth_frames[frame_id], frame_id)
+    visualize_continuously(color_frames, depth_frames, filetime)
+
+    # calc_cylinder(color_frames[frame_id], depth_frames[frame_id], frame_id)
     
